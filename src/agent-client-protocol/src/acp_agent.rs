@@ -289,6 +289,11 @@ impl AcpAgent {
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().map_err(crate::Error::into_internal_error)?;
+        // Windows has no process groups: put the child in a kill-on-close
+        // job, which every process it starts joins unless it asks to break
+        // away, so `ChildGuard` can end the whole tree as it does on unix.
+        #[cfg(windows)]
+        windows_job::adopt(&child);
 
         let child_stdin = child
             .stdin
@@ -307,8 +312,86 @@ impl AcpAgent {
     }
 }
 
-/// A wrapper around Child that kills the process — and, on unix, its whole
-/// process group (see `spawn_process`) — when dropped.
+/// The Windows counterpart of the unix process group: a job object per
+/// spawned agent, with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, held here by the
+/// child's process id until `ChildGuard` releases it. A child spawned through
+/// the `spawn_process` escape hatch and never guarded keeps its job until this
+/// process exits, when Windows closes the handle and the tree goes with it.
+///
+/// The child is assigned after `CreateProcess` returns rather than created
+/// suspended, since `async_process` does not expose the main thread to
+/// resume; a launcher needs milliseconds to load before it can start anything,
+/// so the assignment wins that race. Nested jobs need Windows 8 or later.
+#[cfg(windows)]
+mod windows_job {
+    use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    /// A job handle, closed on drop.
+    struct Job(HANDLE);
+
+    // SAFETY: a job handle may be used and closed from any thread.
+    unsafe impl Send for Job {}
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from `CreateJobObjectW` and is closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(Default::default);
+
+    /// Puts `child` in a new kill-on-close job. On failure the child is left
+    /// as before, killed alone.
+    pub(super) fn adopt(child: &async_process::Child) {
+        // SAFETY: plain Win32 calls on a handle created here and one the
+        // child owns for its lifetime; the job is closed on every failure.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return;
+            }
+            let job = Job(job);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .unwrap_or(u32::MAX),
+            );
+            if set == 0 || AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) == 0 {
+                return;
+            }
+            JOBS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(child.id(), job);
+        }
+    }
+
+    /// Closes the job of the child with process id `pid`, if it has one,
+    /// which kills every process still in it.
+    pub(super) fn release(pid: u32) {
+        let job = JOBS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&pid);
+        drop(job);
+    }
+}
+
+/// A wrapper around Child that kills the process — and its whole process
+/// group on unix, or its job on Windows (see `spawn_process`) — when dropped.
 struct ChildGuard(Child);
 
 impl ChildGuard {
@@ -327,6 +410,10 @@ impl ChildGuard {
         if let Some(pid) = rustix::process::Pid::from_raw(self.0.id().cast_signed()) {
             let _result = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
+        // Closing the child's job kills every process in it: the wrapper,
+        // the real agent, and the tools it started (see `windows_job`).
+        #[cfg(windows)]
+        windows_job::release(self.0.id());
         // Fallback for platforms without group semantics (and a no-op double
         // tap on unix).
         drop(self.0.kill());
