@@ -169,7 +169,12 @@ impl AcpAgentConfig {
 pub struct AcpAgent {
     config: AcpAgentConfig,
     debug_callback: Option<DebugCallback>,
+    spawned_callback: Option<SpawnedCallback>,
 }
+
+/// Called once with the operating-system id of the process a connection
+/// spawned, before any byte is written to it. See [`AcpAgent::with_spawned`].
+pub type SpawnedCallback = Arc<dyn Fn(u32) + Send + Sync + 'static>;
 
 impl std::fmt::Debug for AcpAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -178,6 +183,10 @@ impl std::fmt::Debug for AcpAgent {
             .field(
                 "debug_callback",
                 &self.debug_callback.as_ref().map(|_| "..."),
+            )
+            .field(
+                "spawned_callback",
+                &self.spawned_callback.as_ref().map(|_| "..."),
             )
             .finish()
     }
@@ -190,6 +199,7 @@ impl AcpAgent {
         Self {
             config,
             debug_callback: None,
+            spawned_callback: None,
         }
     }
 
@@ -243,6 +253,22 @@ impl AcpAgent {
         F: Fn(&str, LineDirection) + Send + Sync + 'static,
     {
         self.debug_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Add a callback that receives the id of the process a connection spawns.
+    ///
+    /// Called once per [`ConnectTo::connect_to`](crate::ConnectTo::connect_to),
+    /// right after the spawn and before any protocol traffic, so a host can
+    /// record which process it started (on Unix, the leader of the agent's
+    /// process group). Not called by [`Self::spawn_process`], whose caller
+    /// holds the child already.
+    #[must_use]
+    pub fn with_spawned<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32) + Send + Sync + 'static,
+    {
+        self.spawned_callback = Some(Arc::new(callback));
         self
     }
 
@@ -745,6 +771,9 @@ impl<Counterpart: AcpAgentCounterpartRole> crate::ConnectTo<Counterpart> for Acp
         use futures::{AsyncBufReadExt, StreamExt};
 
         let (child_stdin, child_stdout, child_stderr, child) = self.spawn_process()?;
+        if let Some(spawned) = &self.spawned_callback {
+            spawned(child.id());
+        }
 
         // Completion and captured data have separate lifetimes: a shutdown
         // timeout must not discard diagnostics already read from the pipe.
@@ -1466,6 +1495,26 @@ mod tests {
         .await
         .is_ok();
         assert!(exited, "descendant process {pid} remained alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_spawned_reports_the_process_it_started() {
+        let (agent, mut pid_rx) =
+            wrapper_agent("echo ACP_TEST_CHILD_PID=$$ >&2; exec 1>&-; while :; do sleep 30; done");
+        let spawned = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&spawned);
+        let agent = agent.with_spawned(move |pid| seen.lock().unwrap().push(pid));
+        let mut connection: futures::future::BoxFuture<'static, Result<(), crate::Error>> =
+            Box::pin(Client.builder().connect_to(agent));
+        let child_pid = reported_descendant_pid(&mut connection, &mut pid_rx).await;
+        let mut cleanup = KillOnDrop(Some(child_pid));
+
+        let reported = u32::try_from(child_pid.as_raw_nonzero().get()).unwrap();
+        assert_eq!(*spawned.lock().unwrap(), vec![reported]);
+        drop(connection);
+        assert_process_exits(child_pid).await;
+        cleanup.disarm();
     }
 
     #[cfg(unix)]
